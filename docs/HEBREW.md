@@ -275,7 +275,7 @@ Configure these values in `.env`, then restart the app:
 
 ```ini
 TRANSLATION_NUM_CTX=4096
-TRANSLATION_MAX_TOKENS=768
+TRANSLATION_MAX_TOKENS=1536
 TRANSLATION_TIMEOUT_SECONDS=45
 TRANSLATION_KEEP_ALIVE=10m
 ```
@@ -381,3 +381,15 @@ If TranslateGemma drops inline formula placeholders, one bounded retry presents
 the original notation. Its protected spans must match before the original math
 is restored; altered equations are rejected. This does not automatically switch
 to a larger model.
+
+### Recovering from output-token limits
+
+`Translation reached its token limit before completing` means generation stopped
+before a whole translation was returned. Local translations have their own output
+budget (`TRANSLATION_MAX_TOKENS`, default 1536), even when reusing the tutor model.
+On truncation, the app discards the partial block and retries smaller pieces, up
+to two splits deep, without repeating completed blocks. Formulas, code and citation
+IDs remain protected, validation still runs, and all retries share the original
+`TRANSLATION_TIMEOUT_SECONDS` deadline. This improves recovery; it cannot guarantee
+translation quality or completion from every model. If the selected model still
+fails, choose an installed dedicated translator under **Hebrew / עברית**.

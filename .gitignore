@@ -8,3 +8,7 @@ __pycache__/
 # regenerable build artifacts (rebuilt by build_index.py from material/)
 db/index/
 db/chunks.jsonl
+
+# Private, opt-in homework progress
+db/homework_progress/
+.pip-tmp/

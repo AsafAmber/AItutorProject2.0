@@ -5,6 +5,7 @@ Run:  streamlit run app.py
 """
 from __future__ import annotations
 
+import copy
 import html
 import os
 import re
@@ -21,16 +22,17 @@ import rag_engine as rag
 from local_models import HEBREW_MODELS, TRANSLATION_MODELS, TUTOR_MODELS, model_options, model_label, translation_fallback_model
 from homework_material import (
     homework_pdf_path, homework_clarification, selected_statements,
-    problem_numbers, resolve_homework_followup, homework_content_request, homework_overview_answer,
+    problem_numbers, homework_content_request,
 )
 from curriculum import CURRICULUM_FILE, course_name
+import homework_progress as progress_store
+from homework_images import question_images
+from math_rendering import fix_math
+from citation_display import expand_citations
 
 os.chdir(Path(__file__).parent)
 
-# Homework mode is hidden from the UI for now (not relevant to the current
-# use case) — the underlying homework logic, data, and tests are untouched,
-# so flip this back to True to restore the mode picker + assignment UI.
-SHOW_HOMEWORK_MODE = False
+SHOW_HOMEWORK_MODE = True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page + theme
@@ -293,6 +295,8 @@ header[data-testid="stHeader"] { background: transparent !important; }
 /* radio buttons — segmented control style */
 .stRadio {
     display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
 }
 .stRadio [role="radiogroup"] {
     gap: 2px !important;
@@ -423,6 +427,7 @@ UI_TEXT = {
         "answer_translation_failed": "⚠️ I found the answer, but couldn't translate it. See the reason below.",
         "translation_invalid": "The translator's output failed validation; this does not mean the model is missing.",
         "translation_timeout": "The translator exceeded its time limit.",
+        "translation_limit": "The translation stopped before finishing, even after retrying smaller sections. Choose another translation model under Hebrew / עברית and try again.",
         "translation_missing": "The selected translation model was not found on the Ollama server.",
         "translation_connection": "Could not connect to the translation server. Check that it is running.",
         "translation_unknown": "The translation request failed. Details are available below.",
@@ -485,6 +490,7 @@ UI_TEXT = {
         "translation_failed": "⚠️ התרגום נכשל",
         "translation_invalid": "התרגום שהמודל החזיר לא עבר אימות. אין פירוש הדבר שהמודל אינו מותקן.",
         "translation_timeout": "מודל התרגום חרג ממגבלת הזמן.",
+        "translation_limit": "התרגום נעצר לפני שהושלם, גם לאחר ניסיון בקטעים קטנים יותר. בחרו מודל תרגום אחר בתפריט עברית / Hebrew ונסו שוב.",
         "translation_missing": "מודל התרגום שנבחר לא נמצא בשרת Ollama.",
         "translation_connection": "לא ניתן להתחבר לשרת התרגום. בדקו שהוא פועל.",
         "translation_unknown": "בקשת התרגום נכשלה. פרטי השגיאה מופיעים בהמשך.",
@@ -563,34 +569,12 @@ def ollama_models(base_url: str | None = None) -> list[str]:
         return []
 
 
-_BACKTICK_SPAN_RE = re.compile(r"(?<!`)`(?!`)([^`\n]+?)(?<!`)`(?!`)")
-_LOOKS_LIKE_MATH_RE = re.compile(r"\\[a-zA-Z]|\^|\bf_?\d*\s*\([^()\n]*\)\s*=")
-
-
-def fix_math(text: str) -> str:
-    """Normalize the model's math formatting to KaTeX delimiters.
-
-    Beyond the \\(\\)/\\[\\] LaTeX delimiters the prompt explicitly forbids,
-    the model sometimes wraps math (e.g. `f_1(n) = 10n`, `n^{1.3}`,
-    `\\log_2 n`) in single backticks like inline code instead of $...$ —
-    prompt instructions alone don't reliably stop this, so this catches it
-    mechanically. Leaves real inline code (plain identifiers) and fenced
-    ```code blocks``` untouched — only spans that look mathy (a LaTeX
-    command, a caret exponent, or an f(n)= style definition) get converted.
-    """
-    text = re.sub(r"\\\[(.+?)\\\]", r"$$\1$$", text, flags=re.DOTALL)
-    text = re.sub(r"\\\((.+?)\\\)", r"$\1$", text, flags=re.DOTALL)
-
-    def _convert(m: re.Match) -> str:
-        inner = m.group(1)
-        return f"${inner}$" if _LOOKS_LIKE_MATH_RE.search(inner) else m.group(0)
-
-    return _BACKTICK_SPAN_RE.sub(_convert, text)
-
-
-def render_md(target, content: str, rtl: bool = False) -> None:
+def render_md(target, content: str, rtl: bool = False, citations: list[dict] | None = None) -> None:
     """Render markdown; Hebrew goes in a keyed container that the CSS above lays out
     right-to-left, so no text (including the user's) is ever rendered as raw HTML."""
+    if citations:
+        content = expand_citations(content, citations, "he" if rtl else "en")
+    content = fix_math(content)
     if rtl:
         target.container(key=f"rtl-{uuid.uuid4().hex}").markdown(content)
     else:
@@ -634,6 +618,47 @@ if (not CURRICULUM_FILE.exists() or not rag.INDEX_DIR.exists()
 meta = rag.load_meta()
 homework = rag.load_homework()
 retriever = get_retriever(rag.CHUNKS_FILE.stat().st_mtime_ns)
+
+def checkpoint_homework():
+    """Capture the current question before navigating away or saving a turn."""
+    progress = st.session_state.setdefault("hw_progress", {"conversations": {}, "completed": {}})
+    active = st.session_state.get("hw_chat_key")
+    if active:
+        progress.setdefault("conversations", {})[active] = {
+            "display": copy.deepcopy(st.session_state.get("display", [])),
+            "history": [{"role": "user" if isinstance(m, HumanMessage) else "assistant",
+                         "content": m.content} for m in st.session_state.get("history", [])],
+        }
+    if st.session_state.get("save_hw_progress"):
+        code = st.session_state.setdefault("hw_resume_code", progress_store.new_code())
+        try:
+            progress_store.write_progress(code, progress)
+        except OSError:
+            st.warning("Could not save progress. Check available disk space and folder permissions. / לא ניתן לשמור התקדמות.")
+
+
+def update_homework_completion(assignment_key, number, widget_key):
+    completed = st.session_state.hw_progress["completed"][assignment_key]
+    if st.session_state[widget_key] and number not in completed:
+        completed.append(number)
+    elif not st.session_state[widget_key] and number in completed:
+        completed.remove(number)
+
+
+pending_resume = st.session_state.pop("hw_pending_resume", None)
+if pending_resume:
+    code, loaded = pending_resume
+    st.session_state.hw_progress = loaded
+    st.session_state.hw_resume_code = code
+    st.session_state.save_hw_progress = True
+    st.session_state.save_hw_widget = True
+    st.session_state.pop("hw_chat_key", None)
+    st.session_state.pop("ctx", None)
+    st.session_state.hw_restore_selection = True
+    for key in list(st.session_state):
+        if key.startswith("done_"):
+            del st.session_state[key]
+checkpoint_homework()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
@@ -684,7 +709,7 @@ with st.sidebar:
             t("mode"),
             ["learn", "homework"],
             format_func=lambda value: t(value),
-            label_visibility="collapsed",
+            label_visibility="collapsed", key="study_mode",
         )
     else:
         mode = "learn"
@@ -706,10 +731,47 @@ with st.sidebar:
         display_name = localized_title(sel, meta[sel].get("display_name", sel), ui_lang)
         topics = rag.covered_topics(week)
     else:
+        progress = st.session_state.hw_progress
+        if st.session_state.get("ctx", (None,))[0] == "learn" and progress.get("assignment"):
+            st.session_state.hw_restore_selection = True
+        st.toggle("שמירת התקדמות לפעם הבאה" if ui_is_he else "Save progress for next session",
+                  value=st.session_state.get("save_hw_progress", False), key="save_hw_widget",
+                  on_change=lambda: st.session_state.update(
+                      save_hw_progress=st.session_state.save_hw_widget))
+        if st.session_state.get("save_hw_progress", False):
+            checkpoint_homework()
+            st.caption("שמרו את הקוד והזינו אותו בפעם הבאה. כל מי שמחזיק בקוד יכול לפתוח את ההתקדמות."
+                       if ui_is_he else "Keep this code and enter it next session. Anyone with the code can open this progress.")
+            st.code(st.session_state.hw_resume_code, language=None)
+        with st.expander("פתיחת התקדמות שמורה" if ui_is_he else "Resume saved progress"):
+            resume_code = st.text_input("קוד חזרה" if ui_is_he else "Resume code", type="password")
+            if st.button("פתיחה" if ui_is_he else "Resume"):
+                try:
+                    loaded = progress_store.read_progress(resume_code.strip())
+                except (OSError, ValueError, TypeError):
+                    st.error("לא ניתן לפתוח את הקוד הזה." if ui_is_he else "Could not open that resume code.")
+                else:
+                    st.session_state.hw_pending_resume = (resume_code.strip(), loaded)
+                    st.rerun()
+        if st.session_state.get("hw_resume_code") and not st.session_state.get("save_hw_progress", False):
+            try:
+                progress_store.delete_progress(st.session_state.hw_resume_code)
+                st.session_state.pop("hw_resume_code", None)
+            except OSError:
+                st.error("Could not delete saved progress. / לא ניתן למחוק התקדמות שמורה.")
+        st.caption("הכיבוי מוחק את העותק השמור. השמירה היא במחשב שמריץ את האפליקציה."
+                   if ui_is_he else "Turning saving off deletes the saved copy. Saves stay on this app installation.")
         hw_ids = sorted(homework, key=lambda key: homework[key].get("week", 0))
+        if not hw_ids:
+            st.info("No homework assignments are available. / אין מטלות זמינות.")
+            st.stop()
+        if st.session_state.get("hw_restore_selection"):
+            if progress.get("assignment") in hw_ids:
+                st.session_state.hw_assignment = progress["assignment"]
+            st.session_state.pop("hw_question", None)
         sel = st.selectbox(
             t("assignment"),
-            hw_ids,
+            hw_ids, key="hw_assignment",
             format_func=lambda key: t(
                 "week_assignment",
                 week=homework[key].get("week", "?"),
@@ -723,6 +785,32 @@ with st.sidebar:
         week = homework[sel].get("week", 1)
         display_name = localized_title(sel, homework[sel].get("title", sel), ui_lang)
         topics = rag.covered_topics(week)
+        statements = homework[sel].get("problem_statements", [])
+        numbers = [p["number"] for p in statements]
+        if not numbers:
+            st.error(t("homework_unavailable"))
+            st.stop()
+        completed_key = sel + ":" + homework[sel].get("pdf_sha256", "")
+        completed = progress.setdefault("completed", {}).setdefault(completed_key, [])
+        if st.session_state.pop("hw_restore_selection", False):
+            if progress.get("question") in numbers:
+                st.session_state.hw_question = progress["question"]
+        if st.session_state.get("hw_question") not in numbers:
+            st.session_state.hw_question = numbers[0]
+        selected_problem = st.radio(
+            "שאלה" if ui_is_he else "Question", numbers, key="hw_question",
+            format_func=lambda n, done=tuple(completed): ("✓ " if n in done else "") +
+                                 (f"שאלה {n}" if ui_is_he else f"Question {n}"))
+        done_key = f"done_{completed_key}_{selected_problem}"
+        st.session_state[done_key] = selected_problem in completed
+        st.checkbox("סיימתי את השאלה" if ui_is_he else "Mark question completed",
+                    key=done_key, on_change=update_homework_completion,
+                    args=(completed_key, selected_problem, done_key))
+        st.caption(f"{len(completed)} / {len(numbers)} " + ("הושלמו" if ui_is_he else "completed"))
+        progress.update(assignment=sel, question=selected_problem)
+        selected_statement = next(p for p in statements if p["number"] == selected_problem)
+        # Restrict assignment context to the question selected in the sidebar.
+        homework[sel] = {**homework[sel], "problem_statements": [selected_statement]}
         if homework[sel].get("source_error"):
             st.error(t("homework_unavailable"))
         else:
@@ -873,6 +961,7 @@ with st.sidebar:
         st.session_state.pop("active_homework_problems", None)
         st.session_state.pop("quiz_chunks", None)
         st.session_state.pop("followup_chunks", None)
+        checkpoint_homework()
         st.rerun()
     st.caption(
         t(
@@ -884,7 +973,8 @@ with st.sidebar:
 
 # Reset chat when the context changes
 ctx_key = (mode, sel, tuple(topics), CURRICULUM_FILE.stat().st_mtime_ns,
-           homework[sel].get("pdf_sha256") if is_hw else None)
+           homework[sel].get("pdf_sha256") if is_hw else None,
+           selected_problem if is_hw else None)
 if st.session_state.get("ctx") != ctx_key:
     st.session_state.ctx = ctx_key
     st.session_state.history = []
@@ -892,6 +982,45 @@ if st.session_state.get("ctx") != ctx_key:
     st.session_state.active_homework_problems = []
     st.session_state.quiz_chunks = []
     st.session_state.followup_chunks = []
+    st.session_state.hw_chat_key = (progress_store.context_id(
+        sel, selected_problem, homework[sel].get("pdf_sha256", ""), list(topics)) if is_hw else None)
+    if is_hw:
+        saved = st.session_state.hw_progress.get("conversations", {}).get(st.session_state.hw_chat_key, {})
+        st.session_state.display = copy.deepcopy(saved.get("display", []))
+        st.session_state.history = [
+            (HumanMessage if m["role"] == "user" else AIMessage)(m["content"])
+            for m in saved.get("history", [])]
+        st.session_state.active_homework_problems = [selected_problem]
+
+checkpoint_homework()
+
+if is_hw:
+    st.subheader(f"{display_name} · " + (f"שאלה {selected_problem}" if ui_is_he else f"Question {selected_problem}"))
+    st.caption(("עמודים בקובץ: " if ui_is_he else "PDF pages: ") +
+               ", ".join(map(str, selected_statement.get("pages", []))))
+    original_key = f"hw_original_{completed_key}_{selected_problem}"
+    show_original = st.session_state.get(original_key, False)
+    image_button_label = (("הצגת השאלה בלבד" if ui_is_he else "Show question only") if show_original
+                          else ("הצגת העמודים המקוריים" if ui_is_he else "Show original pages"))
+    if st.button(image_button_label, key="toggle_original_pages"):
+        show_original = not show_original
+        st.session_state[original_key] = show_original
+        st.rerun()
+    try:
+        images = question_images(homework[sel], selected_statement, original=show_original)
+    except ImportError:
+        st.error("PDF image rendering needs PyMuPDF. / הצגת תמונות דורשת PyMuPDF.")
+        st.code("python -m pip install pymupdf", language="sh")
+        st.info("Use the assignment PDF download to read the original formulas. / אפשר להוריד את קובץ המטלה המקורי.")
+    except (OSError, ValueError, RuntimeError):
+        st.error("Could not render the question. Download the original PDF from the sidebar. / לא ניתן להציג את השאלה. הורידו את הקובץ המקורי מהתפריט.")
+    else:
+        for image in images:
+            page_label = ("עמוד " if ui_is_he else "Page ") + str(image["page"])
+            if not image["cropped"]:
+                page_label += " · " + ("העמוד המקורי המלא" if ui_is_he else "full original page")
+            st.image(image["png"], caption=page_label, use_container_width=True)
+    st.divider()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Hero + suggestions (empty chat)
@@ -899,7 +1028,7 @@ if st.session_state.get("ctx") != ctx_key:
 
 pending = None
 
-if not st.session_state.get("display"):
+if not is_hw and not st.session_state.get("display"):
     subtitle = t("hero_homework") if is_hw else t("hero_learn")
     st.markdown(
         f"<div class='hero'><div class='logo'>{'💪' if is_hw else '🎓'}</div>"
@@ -926,7 +1055,8 @@ if not st.session_state.get("display"):
 
 for m in st.session_state.get("display", []):
     with st.chat_message(m["role"], avatar="🧑‍🎓" if m["role"] == "user" else "🎓"):
-        render_md(st, m["content"], rtl=m.get("rtl", False))
+        render_md(st, m["content"], rtl=m.get("rtl", False),
+                  citations=m.get("sources") if m["role"] == "assistant" else None)
         if m.get("translation_error"):
             with st.expander("Translation error / שגיאת תרגום"):
                 st.text(m["translation_error"])
@@ -999,7 +1129,8 @@ if question and not (is_hw and homework[sel].get("source_error")):
         decision_status = None
         active_problems = st.session_state.get("active_homework_problems", []) if is_hw else []
         contextual_question = rag.expand_course_abbreviations(question)
-        contextual_question = resolve_homework_followup(contextual_question, active_problems) if is_hw else contextual_question
+        contextual_question = (progress_store.focused_question(contextual_question, selected_problem)
+                               if is_hw and not problem_numbers(contextual_question) else contextual_question)
         # Only worth detecting "that's a homework question" when Homework mode
         # is actually reachable — with it hidden there's nowhere to send the
         # student, so let it fall through to the normal evidence-gate reply.
@@ -1035,7 +1166,8 @@ if question and not (is_hw and homework[sel].get("source_error")):
                 status.update(label=mt("checking_scope"))
                 try:
                     retrieval_question = rag.expand_course_abbreviations(query_en)
-                    retrieval_question = resolve_homework_followup(retrieval_question, active_problems) if is_hw else retrieval_question
+                    retrieval_question = (progress_store.focused_question(retrieval_question, selected_problem)
+                                          if is_hw and not problem_numbers(retrieval_question) else retrieval_question)
                     decision = rag.prepare_retrieval(
                         retrieval_question, week, retriever, homework[sel] if is_hw else None,
                         k=k_val, mode=ret_mode, normalization_llm=llm)
@@ -1132,13 +1264,29 @@ if question and not (is_hw and homework[sel].get("source_error")):
 
             status.update(label=mt("formulating"))
             slot = st.empty()
+            source_label, assignment_label = ("מקור", "מטלה") if q_is_he else ("Source", "Assignment")
+            citation_sources = ([
+                {"section": f"{source_label} {i} — {hit.chunk.section}", "score": hit.similarity}
+                for i, hit in enumerate(hits, 1)
+            ] + [
+                {"section": f"{assignment_label} {i} — {homework[sel].get('title', sel)} — {Path(homework[sel]['problem_pdf']).name}, "
+                            f"Problem {p['number']}, PDF pages {', '.join(map(str, p['pages']))}",
+                 "score": None}
+                for i, p in enumerate(assignment_sources, 1)
+            ])
+
             generation_error = None
             evidence_error = None
             blocked_tutorial = 0
             solution_leaked = False
             try:
                 if is_hw and homework_content_request(interpreted_question):
-                    answer_en = homework_overview_answer(homework[sel], interpreted_question)
+                    answer_en = (
+                        "Read the original question image above; it preserves the PDF's formulas and diagrams. "
+                        "You can also download the assignment PDF from the sidebar.\n\n"
+                        + "\n".join(f"Problem {p['number']} (Assignment {i})"
+                                    for i, p in enumerate(assignment_sources, 1))
+                        + "\n\nTell me what you have tried, and I can help with a hint.")
                     rag.validate_citations(answer_en, len(hits), len(assignment_sources))
                 else:
                     evidence = {**{f"Source {i}": h.chunk.text for i, h in enumerate(hits, 1)},
@@ -1191,7 +1339,7 @@ if question and not (is_hw and homework[sel].get("source_error")):
                         raise rag.FutureMaterialError(translated_future)
                     rag.validate_citations(answer, len(hits), len(assignment_sources))
                     answer = rag.localize_citations(rag.split_grouped_citations(answer), "he")
-                    render_md(slot, answer, rtl=True)
+                    render_md(slot, answer, rtl=True, citations=citation_sources)
                     history_ready = True
                     status.update(
                         label=mt("answered", count=len(hits), week=week),
@@ -1215,7 +1363,7 @@ if question and not (is_hw and homework[sel].get("source_error")):
                     status.update(label=mt("translation_failed"), state="error", expanded=False)
             else:
                 answer = answer_en
-                slot.markdown(answer)
+                render_md(slot, answer, citations=citation_sources)
                 status.update(
                     label=mt("answered", count=len(hits), week=week),
                     state="complete",
@@ -1223,16 +1371,7 @@ if question and not (is_hw and homework[sel].get("source_error")):
                 )
                 history_ready = True
 
-            source_label, assignment_label = ("מקור", "מטלה") if q_is_he else ("Source", "Assignment")
-            sources = ([
-                {"section": f"{source_label} {i} — {hit.chunk.section}", "score": hit.similarity}
-                for i, hit in enumerate(hits, 1)
-            ] + [
-                {"section": f"{assignment_label} {i} — {Path(homework[sel]['problem_pdf']).name}, "
-                            f"Problem {p['number']}, PDF pages {', '.join(map(str, p['pages']))}",
-                 "score": None}
-                for i, p in enumerate(assignment_sources, 1)
-            ]) if history_ready else []
+            sources = citation_sources if history_ready else []
 
     # Only successful interactions enter the English history used by the LLM.
     if history_ready:
@@ -1267,4 +1406,5 @@ if question and not (is_hw and homework[sel].get("source_error")):
             "translation_error": translation_diagnostic,
         },
     ]
+    checkpoint_homework()
     st.rerun()

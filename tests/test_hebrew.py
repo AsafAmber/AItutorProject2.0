@@ -202,7 +202,7 @@ def test_local_rejects_corrupt_or_wrong_topic_translation(output):
         translate('Divide and conquer solves problems.', 'he', StructuredLocal(output))
 
 
-def test_local_rejects_partial_output_and_does_not_retry_fragments():
+def test_local_rejects_truncated_output_when_input_is_too_short_to_split():
     llm = StructuredLocal('זרימה', done_reason='length')
     with pytest.raises(ValueError, match='token limit'):
         translate('A flow satisfies $f(e)$ on every edge.', 'he', llm)
@@ -439,3 +439,105 @@ def test_full_source_titles_use_the_same_citation_validation_as_translation():
     validate_citations('(Source 1 — Tutorial 2 — Divide & Conquer › Core Concepts) An explanation.', 1)
     with pytest.raises(EvidenceError, match='not supplied'):
         validate_citations('(Source 99 — Tutorial 2 — Core Concepts) An explanation.', 1)
+
+
+def test_truncated_translation_recovers_by_splitting_without_losing_input():
+    import json
+    class Adaptive(StructuredLocal):
+        def __init__(self):
+            super().__init__('')
+            self.inputs = []
+            self.completed = []
+            self.closed = 0
+
+        def stream(self, messages, **kwargs):
+            self.calls += 1
+            source = messages[-1].content
+            self.inputs.append(source)
+            try:
+                if len(source) > 260:
+                    yield AIMessage(content='PARTIAL OUTPUT MUST BE DISCARDED',
+                                    response_metadata={'done_reason': 'length'})
+                else:
+                    self.completed.append(source)
+                    yield AIMessage(content=json.dumps({'translation': source}))
+            finally:
+                self.closed += 1
+    source = ('This explanation must remain complete and in order. ' * 7 + '\n\n'
+              'The formula is $x^2$ (Source 1). Use `value`.\n'
+              + 'The final explanation also must remain complete. ' * 4)
+    llm = Adaptive()
+    assert translate(source, 'en', llm) == source
+    assert llm.calls > len(llm.completed)
+    assert llm.closed == llm.calls
+    assert 'PARTIAL OUTPUT' not in ''.join(llm.completed)
+
+
+def test_truncated_hebrew_translation_restores_math_code_and_citations():
+    import json
+    import re
+    class Adaptive(StructuredLocal):
+        def stream(self, messages, **kwargs):
+            self.calls += 1
+            source = messages[-1].content
+            if self.calls == 1:
+                yield AIMessage(content='תרגום חלקי שאסור להציג', response_metadata={'done_reason': 'length'})
+            else:
+                tokens = re.findall(r'⟦[^⟧]+⟧|\(Source \d+\)', source)
+                yield AIMessage(content=json.dumps({'translation': 'זהו הסבר מתורגם. ' + ' '.join(tokens)}, ensure_ascii=False))
+    source = 'A full explanation of the formula and its meaning. ' * 4 + '$n^2$ (Source 1) and `value`.'
+    llm = Adaptive('')
+    result = translate(source, 'he', llm)
+    assert llm.calls == 3
+    for protected in ('$n^2$', '(Source 1)', '`value`'):
+        assert result.count(protected) == 1
+    assert 'תרגום חלקי' not in result
+
+
+def test_repeated_truncation_stops_with_a_bounded_error():
+    llm = StructuredLocal('partial', done_reason='length')
+    with pytest.raises(ValueError, match='token limit'):
+        translate('A sentence with several words. ' * 20, 'he', llm)
+    assert llm.calls == 3  # Original block, smaller block, final smallest block.
+
+
+def test_token_retries_share_the_original_deadline(monkeypatch):
+    import rag_engine
+    readings = iter([0, 0, 0, 46])
+    monkeypatch.setattr(rag_engine.time, 'monotonic', lambda: next(readings))
+    monkeypatch.setenv('TRANSLATION_TIMEOUT_SECONDS', '45')
+    llm = StructuredLocal('partial', done_reason='length')
+    with pytest.raises(TimeoutError, match='time limit'):
+        translate('A sentence with several words. ' * 8, 'he', llm)
+    assert llm.calls == 1
+
+
+def test_reused_tutor_gets_translation_budget_without_mutation(monkeypatch):
+    class ChatOllama(StructuredLocal):
+        format = None
+        num_predict = 17
+        num_ctx = 8192
+        def stream(self, messages, **kwargs):
+            assert kwargs['options']['num_predict'] == 2048
+            assert kwargs['options']['num_ctx'] == 8192
+            assert kwargs['options']['temperature'] == 0
+            assert kwargs['reasoning'] is False
+            yield from super().stream(messages, **kwargs)
+    monkeypatch.setenv('TRANSLATION_MAX_TOKENS', '2048')
+    llm = ChatOllama('בעיה.')
+    assert translate('A problem.', 'he', llm) == 'בעיה.'
+    assert llm.num_predict == 17
+
+
+def test_split_preserves_complete_citation_and_marker_tokens():
+    from rag_engine import _split_translation_block
+    original = 'A detailed explanation. ' * 5 + '(Source 1) ⟦0⟧ ' + 'Another detailed explanation. ' * 5
+    parts = _split_translation_block(original)
+    assert ''.join(parts) == original
+    assert sum('(Source 1)' in part for part in parts) == 1
+    assert sum('⟦0⟧' in part for part in parts) == 1
+
+
+def test_output_token_limit_is_reported_as_incomplete_not_invalid():
+    from translation_support import translation_error_kind
+    assert translation_error_kind(ValueError('Translation reached its token limit before completing')) == 'limit'

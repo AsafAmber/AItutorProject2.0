@@ -9,12 +9,6 @@ of handing out solutions.
 It runs fully offline with a free local model (Ollama), or with a cloud model
 through OpenRouter or OpenAI.
 
-> **Note:** Homework mode is currently **hidden from the UI** (not needed for
-> the present use case) — the sidebar only shows Learn mode. The underlying
-> homework logic, data, and tests are untouched and fully working; it's a
-> one-line flip (`SHOW_HOMEWORK_MODE = True` in `app.py`) to bring the mode
-> picker and assignment UI back.
-
 ## What it does
 
 - **Answers from the course material.** Every question retrieves passages from the
@@ -23,9 +17,10 @@ through OpenRouter or OpenAI.
 - **Respects the course week.** Material from later weeks is filtered out before
   retrieval, questions naming later topics are refused, and answers are checked
   again before they are shown. This does not depend on the model obeying a prompt.
-- **Homework mode.** Reads the assignment PDF, shows the exact problem statements,
-  and gives Socratic hints. A separate check rewrites or withholds replies that give
-  away a full solution.
+- **Homework mode.** Choose an assignment and question in the sidebar. The main
+  area shows original PDF images of that question, including its subsections, followed by its own hint
+  conversation. Mark questions completed and optionally save progress for next time.
+  A separate check rewrites or withholds replies that give away a full solution.
 - **Follow-up questions.** "I don't understand" or "why?" continue the previous answer
   with the same sources.
 - **Hebrew.** Hebrew questions are translated to English for retrieval, and the answer
@@ -191,9 +186,16 @@ guide: [docs/HEBREW.md](docs/HEBREW.md).
 
 - **Learn mode:** pick the week you have reached, then ask about any topic up to it.
   Later topics get a 🔒 message saying which week covers them.
-- **Homework mode** (currently hidden from the UI — see note at the top): pick an
-  assignment. Ask "what does problem 2 say?", "give me a hint for problem 3", or
-  "check my reasoning". The assignment PDF can be downloaded from the sidebar.
+- **Homework mode:** pick an assignment and a question in the sidebar. Read the
+  selected question as images from the original PDF in the main area, preserving
+  its formulas, symbols, and diagrams, and ask for hints or feedback on your reasoning.
+  Questions spanning multiple pages appear as multiple images. Crops omit page-number
+  footers and blank margins. Use **Show original pages** to check the uncropped PDF
+  images, then **Show question only** to return to the compact view.
+  Model replies support inline and display LaTeX, including in Hebrew conversations;
+  no system LaTeX installation is needed (Streamlit renders formulas with KaTeX).
+  Each question has a separate conversation that is restored when you switch back.
+  The assignment PDF can be downloaded from the sidebar.
   Each assignment opens the material up to its course week:
 
   | Assignment | Material through week |
@@ -204,9 +206,23 @@ guide: [docs/HEBREW.md](docs/HEBREW.md).
   | HW4 | 8 |
   | HW5 | 9 |
 
-- **Sources:** open **📚 sources** under an answer to see the passages it cited, with
+- **Sources:** citations in the answer body use compact labels such as
+  “Tutorial 7 — pages 2–4” or “Lecture 4 — pages 10–12”. Page references use the
+  PDF page numbering; a missing location is explicitly marked. The original IDs
+  remain in validation and model history. Open **📚 sources** under an answer to see the passages it cited, with
   tutorial, section and PDF pages.
-- Changing the week or assignment clears the conversation.
+- Changing the week resets the Learn conversation. Homework conversations are kept
+  separately for each assignment and question during the session.
+- **Save homework progress:** enable **Save progress for next session** in the
+  Homework sidebar and copy the private resume code. In a new session, open
+  **Resume saved progress**, enter the code, and click **Resume**. This restores
+  your selected assignment/question, completed marks, and question conversations.
+  Saving is off by default. Turning it off deletes the saved copy and retains the
+  current session's progress. Anyone with your code can open the save.
+  Saves live in `db/homework_progress/` on this app installation, are excluded from
+  git, and do not follow you to another clone or server. No provider settings or
+  API keys are stored. Chats are reset for changed PDFs or allowed course topics;
+  completed marks are reset for changed PDFs.
 
 ## Configuration reference
 
@@ -219,6 +235,7 @@ All settings live in `.env` (see [.env.example](.env.example)). The most useful 
 | `OLLAMA_NUM_CTX` | `8192` | Local context window; use `4096` to fit two models in a small GPU |
 | `OPENROUTER_MODEL` | `anthropic/claude-haiku-5.5` | OpenRouter answering model |
 | `TRANSLATION_PROVIDER` | `auto` | See [Hebrew support](#hebrew-support) |
+| `TRANSLATION_MAX_TOKENS` | `1536` | Local translation output budget per block, independent of the tutor |
 | `TRANSLATION_TIMEOUT_SECONDS` | `45` | Translation time limit; raise for slow local models |
 | `LLM_TEMPERATURE` | `0.2` | Answer randomness |
 | `LLM_MAX_TOKENS` | `1200` | Maximum answer length |
@@ -297,7 +314,11 @@ cases need relabeling before those figures can be trusted again.
 ## Project layout
 
 ```
-app.py                  Streamlit chat UI (Learn mode; Homework mode built-in but UI-hidden)
+app.py                  Streamlit chat UI (Learn and question-based Homework modes)
+homework_progress.py    Private, opt-in homework save/resume storage
+homework_images.py      Original-PDF question images and page crops
+math_rendering.py       Code-safe LaTeX delimiter normalization for chat
+citation_display.py     Compact tutorial/lecture labels and page ranges in answer citations
 rag_engine.py           Chunking, retrieval, week gate, answer checks, LLM and translator factories
 curriculum.py           Course schedule, topic matching, later-week detection
 translation_support.py  Translation validation helpers

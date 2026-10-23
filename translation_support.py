@@ -132,6 +132,8 @@ def translation_error_kind(error: Exception) -> str:
         return 'missing'
     if isinstance(error, ConnectionError) or 'connect' in name:
         return 'connection'
+    if 'token limit' in message:
+        return 'limit'
     if isinstance(error, (ValueError, TypeError)):
         return 'invalid'
     return 'unknown'

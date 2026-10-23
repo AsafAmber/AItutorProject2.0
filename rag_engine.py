@@ -1003,7 +1003,7 @@ def get_translation_llm(provider: str | None = None, model: str | None = None,
                                           os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")),
             temperature=0,
             num_ctx=int(os.getenv("TRANSLATION_NUM_CTX", "4096")),
-            num_predict=int(os.getenv("TRANSLATION_MAX_TOKENS", "768")),
+            num_predict=max(256, int(os.getenv("TRANSLATION_MAX_TOKENS", "1536"))),
             repeat_penalty=1.1,
             reasoning=False,
             keep_alive=os.getenv("TRANSLATION_KEEP_ALIVE", "10m"),
@@ -1034,12 +1034,31 @@ def _terms_instruction(text: str) -> str:
     return f'Use these course terms: {terms}.' if terms else ''
 
 
+def _split_translation_block(block: str) -> tuple[str, str] | None:
+    """Bisect a truncated block without splitting a protected marker or citation."""
+    if len(block.strip()) < 80:
+        return None
+    citations = [(m.start(), m.end()) for m in _CITATION_RE.finditer(block)]
+    boundaries = [m.end() for m in re.finditer(r'\s+', block)
+                  if len(block) * 0.2 < m.end() < len(block) * 0.8
+                  and not any(start < m.end() < end for start, end in citations)]
+    if not boundaries:
+        return None
+    sentences = [position for position in boundaries
+                 if block[:position].rstrip().endswith(('.', '!', '?', ':'))
+                 or '\n' in block[max(0, position - 2):position]]
+    cut = min(sentences or boundaries, key=lambda position: abs(position - len(block) / 2))
+    return block[:cut], block[cut:]
+
+
 def _translate_local(text: str, target: str, llm, progress=None) -> str:
     """Translate complete prose blocks, checking short placeholders before restore.
 
     Splitting a sentence at every formula confuses small translators. Keep each
     sentence intact with compact markers, and bound long homework translations
-    by input size. A single repair is allowed across the entire translation.
+    by input size. Token-truncated blocks are retried in smaller pieces (at most
+    two splits deep) under the original time limit. A single validation repair
+    is allowed across the entire translation.
     """
     from langchain_core.messages import HumanMessage, SystemMessage
     from translation_support import validate_translation, translategemma_prompt, normalize_translation_terms
@@ -1096,7 +1115,16 @@ def _translate_local(text: str, target: str, llm, progress=None) -> str:
         return kind, int(match[2])
     generated = 0
     repair_available = True
-    for block in blocks:
+    # A tutor reused for translation must not inherit its answer-length setting.
+    options = {name: getattr(llm, name) for name in (
+        'num_ctx', 'num_gpu', 'num_thread', 'repeat_penalty', 'repeat_last_n',
+        'top_k', 'top_p', 'seed') if getattr(llm, name, None) is not None}
+    options.update(num_predict=max(256, int(os.getenv('TRANSLATION_MAX_TOKENS', '1536'))),
+                   temperature=0)
+    pending = [(block, 0) for block in blocks]
+    while pending:
+        block, split_depth = pending.pop(0)
+        split_retry = False
         prose = re.sub(r'⟦[^⟧]+⟧', '', block)
         if not re.search(r'[A-Za-zא-ת]', _CITATION_RE.sub('', prose)):
             result.append(block)
@@ -1112,7 +1140,9 @@ def _translate_local(text: str, target: str, llm, progress=None) -> str:
             chunks = []
             if time.monotonic() - started > deadline:
                 raise TimeoutError('Local translation exceeded its time limit; check GPU usage or use a smaller model')
-            stream = llm.stream(messages, format="" if native_translation else schema)
+            truncated = False
+            stream = llm.stream(messages, format="" if native_translation else schema,
+                                options=options, reasoning=False)
             try:
                 for chunk in stream:
                     if time.monotonic() - started > deadline:
@@ -1123,10 +1153,22 @@ def _translate_local(text: str, target: str, llm, progress=None) -> str:
                     generated += len(chunk.content)
                     if progress:
                         progress(generated, int(time.monotonic() - started))
-                    if chunk.response_metadata.get('done_reason') == 'length':
-                        raise ValueError('Translation reached its token limit before completing')
+                    if (chunk.response_metadata.get('done_reason') == 'length'
+                            or chunk.response_metadata.get('finish_reason') == 'length'):
+                        truncated = True
+                        break
             finally:
                 stream.close()
+            if truncated:
+                smaller = _split_translation_block(block) if split_depth < 2 else None
+                if smaller is None:
+                    raise ValueError('Translation reached its token limit before completing; '
+                                     'bounded smaller-block retries could not complete it')
+                # Discard all partial output and retry only this block; completed
+                # blocks stay intact, and every retry shares the same deadline.
+                pending[0:0] = [(part, split_depth + 1) for part in smaller]
+                split_retry = True
+                break
             try:
                 try:
                     translated = ''.join(chunks).strip() if native_translation else json.loads(''.join(chunks))['translation']
@@ -1199,6 +1241,8 @@ def _translate_local(text: str, target: str, llm, progress=None) -> str:
                     'No explanations. Copy ' + (marker_list or 'markdown') + ' exactly unchanged. '
                     + _terms_instruction(block)),
                     HumanMessage(block.strip())]
+        if split_retry:
+            continue
         leading = block[:len(block) - len(block.lstrip())]
         trailing = block[len(block.rstrip()):]
         result.append(leading + translated.strip() + trailing)
@@ -1371,6 +1415,7 @@ def translate_with_fallback(text: str, target: str, primary_llm, fallback_llm=No
 
 MATH_RULES = (
     "Format ALL math with KaTeX delimiters: inline $O(n \\log n)$, block $$T(n)=2T(n/2)+O(n)$$. "
+    "Do not wrap math in backticks; reserve code fences for actual code. "
     "Never use \\( \\) or \\[ \\]."
 )
 
