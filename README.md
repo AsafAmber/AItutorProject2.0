@@ -82,6 +82,13 @@ the search index on first run (a few minutes), and starts the app. Open
 - Streamlit asks for an email address on its very first run; press Enter to skip.
 - The first answer after starting is slower while the model loads.
 
+## Hosted demo on Streamlit
+
+Use `cloud/streamlit_app.py` as the Community Cloud entry point. It uses a cloud
+API for answers and translation, runs search embeddings on CPU, and builds the
+missing index automatically. See [deployment and model settings](docs/STREAMLIT_DEMO.md)
+and the [Secrets template](.streamlit/secrets.toml.example).
+
 ## Choosing a model
 
 Set the provider in `.env`, or switch it in the sidebar under **Model**. Restart the

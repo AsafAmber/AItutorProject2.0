@@ -33,6 +33,7 @@ from citation_display import expand_citations
 os.chdir(Path(__file__).parent)
 
 SHOW_HOMEWORK_MODE = True
+CLOUD_DEMO = os.getenv("CLOUD_DEMO") == "1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page + theme
@@ -549,6 +550,9 @@ OPENROUTER_MODELS = ["anthropic/claude-haiku-5.5", "openai/gpt-4o-mini", "openai
 
 def openrouter_model_input(label: str, default: str, key: str) -> str:
     """Common OpenRouter models, plus any other model id typed by hand."""
+    if CLOUD_DEMO:
+        st.caption(f"{label}: {default}")
+        return default
     options = list(dict.fromkeys([default, *OPENROUTER_MODELS]))
     choice = st.selectbox(label, [*options, "custom"], key=key,
                           format_func=lambda value: "Custom / מותאם" if value == "custom" else value)
@@ -603,6 +607,32 @@ def trimmed_history(full: list) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 # Guards: index must exist
 # ─────────────────────────────────────────────────────────────────────────────
+
+@st.cache_resource(show_spinner="Preparing course search on CPU (first startup may take a few minutes)…")
+def prepare_cloud_index():
+    # A cached resource serializes first initialization across browser sessions.
+    # Build from tracked English notes; no LLM/API call or PDF extraction needed.
+    if rag.index_needs_rebuild():
+        rag.build_index(quiet=True)
+    return True
+
+
+if CLOUD_DEMO:
+    if os.getenv("LLM_PROVIDER") not in {"openai", "openrouter"}:
+        st.error("For the cloud demo, set LLM_PROVIDER to openai or openrouter in Secrets.")
+        st.stop()
+    if os.getenv("TRANSLATION_PROVIDER") not in {"tutor", "openai", "openrouter", "auto"}:
+        st.error("For the cloud demo, choose a cloud translation provider or tutor in Secrets.")
+        st.stop()
+    if CURRICULUM_FILE.exists():
+        try:
+            prepare_cloud_index()
+        except Exception:
+            import logging
+            logging.exception("Cloud search index initialization failed")
+            st.error("Could not prepare course search. Check the app logs for download or build errors, then reboot the app.")
+            st.stop()
+
 
 if (not CURRICULUM_FILE.exists() or not rag.INDEX_DIR.exists()
         or not rag.CHUNKS_FILE.exists()):
@@ -821,7 +851,8 @@ with st.sidebar:
     st.divider()
     st.markdown(f"**{t('model_heading')}**")
 
-    providers = ["ollama", "github", "openai", "openrouter"]
+    providers = ([os.getenv("LLM_PROVIDER", "openai")] if CLOUD_DEMO
+                 else ["ollama", "github", "openai", "openrouter"])
     provider_labels = {
         "ollama": "Ollama (מקומי · חינם)" if ui_is_he else "Ollama (local · free)",
         "github": "GitHub Models (חינם)" if ui_is_he else "GitHub Models (free)",
@@ -867,19 +898,24 @@ with st.sidebar:
         api_key = os.getenv("OPENROUTER_API_KEY", "") or st.text_input(
             "OpenRouter API key", type="password", placeholder="sk-or-…", key="openrouter_key")
     else:
-        model = st.selectbox(t("model"), ["gpt-4o-mini", "gpt-4o"])
+        configured_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        models = ([configured_model] if CLOUD_DEMO
+                  else list(dict.fromkeys([configured_model, "gpt-4o-mini", "gpt-4o"])))
+        model = st.selectbox(t("model"), models, disabled=CLOUD_DEMO)
         api_key = os.getenv("OPENAI_API_KEY", "") or st.text_input(
             t("openai_key"), type="password", placeholder="sk-…", key="openai_key")
 
     with st.expander("🌐 Hebrew / עברית"):
-        st.caption("מודלי תרגום מקומיים זמינים לבדיקה" if ui_is_he
-                   else "Local translation candidates")
-        for candidate, info in TRANSLATION_MODELS.items():
-            st.caption(info[0])
-        st.caption("בחרו Ollama כדי לבחור מודל מקומי" if ui_is_he
-                   else "Select Ollama below to choose a local translation model.")
-        translation_choices = ["auto", "ollama", "tutor", "openai", "openrouter"]
+        if not CLOUD_DEMO:
+            st.caption("מודלי תרגום מקומיים זמינים לבדיקה" if ui_is_he
+                       else "Local translation candidates")
+            for candidate, info in TRANSLATION_MODELS.items():
+                st.caption(info[0])
+            st.caption("בחרו Ollama כדי לבחור מודל מקומי" if ui_is_he
+                       else "Select Ollama below to choose a local translation model.")
         configured_translation = os.getenv("TRANSLATION_PROVIDER", "auto")
+        translation_choices = ([configured_translation] if CLOUD_DEMO
+                               else ["auto", "ollama", "tutor", "openai", "openrouter"])
         translation_provider = st.selectbox(
             "מודל תרגום" if ui_is_he else "Translation provider",
             translation_choices,
@@ -920,7 +956,7 @@ with st.sidebar:
         elif translation_provider == "openai":
             translation_model = st.text_input(
                 "מודל תרגום OpenAI" if ui_is_he else "OpenAI translation model",
-                value=os.getenv("TRANSLATION_MODEL", "gpt-4o-mini"))
+                value=os.getenv("TRANSLATION_MODEL", "gpt-4o-mini"), disabled=CLOUD_DEMO)
         elif translation_provider == "openrouter":
             translation_model = openrouter_model_input(
                 "מודל תרגום OpenRouter" if ui_is_he else "OpenRouter translation model",

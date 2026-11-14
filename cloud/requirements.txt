@@ -1,0 +1,5 @@
+# Community Cloud searches the entry point directory before the repository root.
+# A CPU wheel avoids installing NVIDIA runtime packages on the demo host.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu
+-r ../requirements.txt
