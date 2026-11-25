@@ -44,7 +44,7 @@ def test_cloud_bootstraps_missing_index_and_locks_models(monkeypatch, tmp_path, 
         assert os.environ["EMBED_DEVICE"] == "cpu"
         widgets = [w for w in app.selectbox if w.value == provider]
         assert len(widgets) == 1
-        assert len(widgets[0].options) == 1
+        assert len(widgets[0].options) == 2
         assert all("Ollama" not in option for w in app.selectbox for option in w.options)
         if provider == "openai":
             assert any(w.value == model and w.disabled for w in app.selectbox)
@@ -57,6 +57,33 @@ def test_cloud_bootstraps_missing_index_and_locks_models(monkeypatch, tmp_path, 
 
 
 def test_cloud_rejects_local_provider_before_model_loading():
+    st.cache_resource.clear()
+
+
+def test_cloud_switches_to_openrouter_with_a_browser_key(monkeypatch):
+    st.cache_resource.clear()
+    monkeypatch.setattr(rag, "index_needs_rebuild", lambda: False)
+    monkeypatch.setattr(rag, "HybridRetriever", lambda: SimpleNamespace(chunks={}))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    calls = []
+
+    def model_client(**settings):
+        calls.append(settings)
+        return object()
+
+    monkeypatch.setattr(rag, "get_llm", model_client)
+    monkeypatch.setattr(rag, "prepare_retrieval", lambda *a, **kw: rag.RetrievalDecision("insufficient"))
+    with patch.dict(os.environ):
+        app = AppTest.from_file(str(ENTRY))
+        app.secrets.update({"LLM_PROVIDER": "openai", "TRANSLATION_PROVIDER": "tutor",
+                            "OPENROUTER_MODEL": "openai/gpt-4o-mini"})
+        app.run(timeout=15)
+        app.selectbox(key="llm_provider").set_value("openrouter").run(timeout=15)
+        app.text_input(key="openrouter_key").set_value(" sk-or-browser-key ")
+        app.chat_input[0].set_value("Explain binary search").run(timeout=15)
+        assert not app.exception
+        assert calls == [{"provider": "openrouter", "model": "openai/gpt-4o-mini", "api_key": "sk-or-browser-key"}]
+        assert "OPENROUTER_API_KEY" not in os.environ
     st.cache_resource.clear()
     with patch.dict(os.environ):
         app = AppTest.from_file(str(ENTRY))

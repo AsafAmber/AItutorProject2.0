@@ -16,6 +16,21 @@ import streamlit as st
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+# Load top-level Streamlit secrets in both app entry points.
+try:
+    for name, value in st.secrets.items():
+        if isinstance(value, (str, int, float, bool)):
+            os.environ[name] = str(value)
+except FileNotFoundError:
+    pass
+
+CLOUD_DEMO = os.getenv("CLOUD_DEMO") == "1"
+if CLOUD_DEMO:
+    default_cloud_provider = (
+        "openrouter" if os.getenv("OPENROUTER_API_KEY") and not os.getenv("OPENAI_API_KEY") else "openai"
+    )
+    os.environ.setdefault("LLM_PROVIDER", default_cloud_provider)
+    os.environ.setdefault("TRANSLATION_PROVIDER", "tutor")
 load_dotenv(Path(__file__).parent / ".env")
 
 import rag_engine as rag
@@ -33,7 +48,6 @@ from citation_display import expand_citations
 os.chdir(Path(__file__).parent)
 
 SHOW_HOMEWORK_MODE = True
-CLOUD_DEMO = os.getenv("CLOUD_DEMO") == "1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page + theme
@@ -538,10 +552,12 @@ def get_retriever(index_revision: int):
     return rag.HybridRetriever()
 
 
-@st.cache_resource
 def get_llm_cached(provider: str, model: str, api_key: str = ""):
-    # Settings are passed explicitly: one browser session must never change another's.
-    return rag.get_llm(provider=provider, model=model, api_key=api_key or None)
+    settings = (provider, model, api_key)
+    if st.session_state.get("llm_settings") != settings:
+        st.session_state.llm_client = rag.get_llm(provider=provider, model=model, api_key=api_key or None)
+        st.session_state.llm_settings = settings
+    return st.session_state.llm_client
 
 
 OPENROUTER_MODELS = ["anthropic/claude-haiku-5.5", "openai/gpt-4o-mini", "openai/gpt-5-mini",
@@ -609,7 +625,7 @@ def trimmed_history(full: list) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource(show_spinner="Preparing course search on CPU (first startup may take a few minutes)…")
-def prepare_cloud_index():
+def prepare_index():
     # A cached resource serializes first initialization across browser sessions.
     # Build from tracked English notes; no LLM/API call or PDF extraction needed.
     if rag.index_needs_rebuild():
@@ -617,21 +633,23 @@ def prepare_cloud_index():
     return True
 
 
+configured_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 if CLOUD_DEMO:
-    if os.getenv("LLM_PROVIDER") not in {"openai", "openrouter"}:
+    if configured_provider not in {"openai", "openrouter"}:
         st.error("For the cloud demo, set LLM_PROVIDER to openai or openrouter in Secrets.")
         st.stop()
     if os.getenv("TRANSLATION_PROVIDER") not in {"tutor", "openai", "openrouter", "auto"}:
         st.error("For the cloud demo, choose a cloud translation provider or tutor in Secrets.")
         st.stop()
-    if CURRICULUM_FILE.exists():
-        try:
-            prepare_cloud_index()
-        except Exception:
-            import logging
-            logging.exception("Cloud search index initialization failed")
-            st.error("Could not prepare course search. Check the app logs for download or build errors, then reboot the app.")
-            st.stop()
+
+if (CLOUD_DEMO or os.getenv("AUTO_BUILD_INDEX") == "1") and CURRICULUM_FILE.exists():
+    try:
+        prepare_index()
+    except Exception:
+        import logging
+        logging.exception("Search index initialization failed")
+        st.error("Could not prepare course search. Check the app logs for download or build errors, then restart the app.")
+        st.stop()
 
 
 if (not CURRICULUM_FILE.exists() or not rag.INDEX_DIR.exists()
@@ -655,16 +673,23 @@ def checkpoint_homework():
     active = st.session_state.get("hw_chat_key")
     if active:
         progress.setdefault("conversations", {})[active] = {
-            "display": copy.deepcopy(st.session_state.get("display", [])),
+            "display": copy.deepcopy([
+                {key: value for key, value in message.items() if key != "translation_error"}
+                for message in st.session_state.get("display", [])
+            ]),
             "history": [{"role": "user" if isinstance(m, HumanMessage) else "assistant",
                          "content": m.content} for m in st.session_state.get("history", [])],
         }
-    if st.session_state.get("save_hw_progress"):
-        code = st.session_state.setdefault("hw_resume_code", progress_store.new_code())
-        try:
-            progress_store.write_progress(code, progress)
-        except OSError:
-            st.warning("Could not save progress. Check available disk space and folder permissions. / לא ניתן לשמור התקדמות.")
+
+
+def save_homework():
+    code = st.session_state.get("hw_resume_code") or progress_store.new_code()
+    progress = st.session_state.hw_progress
+    if st.session_state.get("hw_last_saved") != progress:
+        progress_store.write_progress(code, progress)
+        st.session_state.hw_last_saved = copy.deepcopy(progress)
+    st.session_state.hw_resume_code = code
+    return code
 
 
 def update_homework_completion(assignment_key, number, widget_key):
@@ -679,9 +704,14 @@ pending_resume = st.session_state.pop("hw_pending_resume", None)
 if pending_resume:
     code, loaded = pending_resume
     st.session_state.hw_progress = loaded
-    st.session_state.hw_resume_code = code
-    st.session_state.save_hw_progress = True
-    st.session_state.save_hw_widget = True
+    if code is None:
+        st.session_state.pop("hw_resume_code", None)
+        st.session_state.pop("hw_last_saved", None)
+    else:
+        st.session_state.hw_resume_code = code
+        st.session_state.hw_last_saved = copy.deepcopy(loaded)
+    st.session_state.save_hw_progress = code is not None
+    st.session_state.save_hw_widget = code is not None
     st.session_state.pop("hw_chat_key", None)
     st.session_state.pop("ctx", None)
     st.session_state.hw_restore_selection = True
@@ -764,33 +794,47 @@ with st.sidebar:
         progress = st.session_state.hw_progress
         if st.session_state.get("ctx", (None,))[0] == "learn" and progress.get("assignment"):
             st.session_state.hw_restore_selection = True
+        st.session_state.setdefault("save_hw_widget", st.session_state.get("save_hw_progress", False))
         st.toggle("שמירת התקדמות לפעם הבאה" if ui_is_he else "Save progress for next session",
-                  value=st.session_state.get("save_hw_progress", False), key="save_hw_widget",
+                  key="save_hw_widget",
                   on_change=lambda: st.session_state.update(
                       save_hw_progress=st.session_state.save_hw_widget))
-        if st.session_state.get("save_hw_progress", False):
-            checkpoint_homework()
-            st.caption("שמרו את הקוד והזינו אותו בפעם הבאה. כל מי שמחזיק בקוד יכול לפתוח את ההתקדמות."
-                       if ui_is_he else "Keep this code and enter it next session. Anyone with the code can open this progress.")
-            st.code(st.session_state.hw_resume_code, language=None)
+        save_status = st.container()
         with st.expander("פתיחת התקדמות שמורה" if ui_is_he else "Resume saved progress"):
             resume_code = st.text_input("קוד חזרה" if ui_is_he else "Resume code", type="password")
             if st.button("פתיחה" if ui_is_he else "Resume"):
                 try:
                     loaded = progress_store.read_progress(resume_code.strip())
-                except (OSError, ValueError, TypeError):
+                except (FileNotFoundError, ValueError, TypeError):
                     st.error("לא ניתן לפתוח את הקוד הזה." if ui_is_he else "Could not open that resume code.")
+                except OSError:
+                    st.error("אחסון ההתקדמות אינו זמין כעת." if ui_is_he else "Progress storage is currently unavailable.")
                 else:
                     st.session_state.hw_pending_resume = (resume_code.strip(), loaded)
+                    st.rerun()
+            st.caption("הורידו גיבוי כדי להמשיך במכשיר או בשרת אחר."
+                       if ui_is_he else "Download a backup to continue on another device or server.")
+            backup_download = st.empty()
+            backup = st.file_uploader("קובץ גיבוי" if ui_is_he else "Progress backup", type=["json"])
+            if backup is not None and st.button("פתיחת גיבוי" if ui_is_he else "Restore backup"):
+                try:
+                    if backup.size > progress_store.BACKUP_LIMIT:
+                        raise ValueError("Backup is too large")
+                    loaded = progress_store.decode_progress(backup.getvalue())
+                except (ValueError, RecursionError):
+                    st.error("לא ניתן לפתוח את הגיבוי." if ui_is_he else "Could not open that progress backup.")
+                else:
+                    st.session_state.hw_pending_resume = (None, loaded)
                     st.rerun()
         if st.session_state.get("hw_resume_code") and not st.session_state.get("save_hw_progress", False):
             try:
                 progress_store.delete_progress(st.session_state.hw_resume_code)
                 st.session_state.pop("hw_resume_code", None)
+                st.session_state.pop("hw_last_saved", None)
             except OSError:
                 st.error("Could not delete saved progress. / לא ניתן למחוק התקדמות שמורה.")
-        st.caption("הכיבוי מוחק את העותק השמור. השמירה היא במחשב שמריץ את האפליקציה."
-                   if ui_is_he else "Turning saving off deletes the saved copy. Saves stay on this app installation.")
+        st.caption("הכיבוי מוחק את העותק השמור בשרת."
+                   if ui_is_he else "Turning saving off deletes the server copy.")
         hw_ids = sorted(homework, key=lambda key: homework[key].get("week", 0))
         if not hw_ids:
             st.info("No homework assignments are available. / אין מטלות זמינות.")
@@ -851,8 +895,7 @@ with st.sidebar:
     st.divider()
     st.markdown(f"**{t('model_heading')}**")
 
-    providers = ([os.getenv("LLM_PROVIDER", "openai")] if CLOUD_DEMO
-                 else ["ollama", "github", "openai", "openrouter"])
+    providers = ["openai", "openrouter"] if CLOUD_DEMO else ["ollama", "github", "openai", "openrouter"]
     provider_labels = {
         "ollama": "Ollama (מקומי · חינם)" if ui_is_he else "Ollama (local · free)",
         "github": "GitHub Models (חינם)" if ui_is_he else "GitHub Models (free)",
@@ -862,9 +905,9 @@ with st.sidebar:
     provider = st.selectbox(
         t("provider"),
         providers,
-        index=providers.index(os.getenv("LLM_PROVIDER", "ollama"))
-        if os.getenv("LLM_PROVIDER", "ollama") in providers else 0,
+        index=providers.index(configured_provider) if configured_provider in providers else 0,
         format_func=provider_labels.get,
+        key="llm_provider",
     )
 
     api_key = ""
@@ -895,8 +938,9 @@ with st.sidebar:
     elif provider == "openrouter":
         model = openrouter_model_input(t("model"), os.getenv("OPENROUTER_MODEL", rag.OPENROUTER_DEFAULT_MODEL),
                                        key="openrouter_model")
-        api_key = os.getenv("OPENROUTER_API_KEY", "") or st.text_input(
+        api_key = os.getenv("OPENROUTER_API_KEY", "").strip() or st.text_input(
             "OpenRouter API key", type="password", placeholder="sk-or-…", key="openrouter_key")
+        api_key = api_key.strip()
     else:
         configured_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         models = ([configured_model] if CLOUD_DEMO
@@ -964,9 +1008,10 @@ with st.sidebar:
                           os.getenv("OPENROUTER_MODEL", rag.OPENROUTER_DEFAULT_MODEL)),
                 key="translation_openrouter_model")
         if translation_provider == "openrouter":
-            translation_api_key = os.getenv("OPENROUTER_API_KEY", "") or (
+            translation_api_key = os.getenv("OPENROUTER_API_KEY", "").strip() or (
                 api_key if provider == "openrouter" else "") or st.text_input(
                 "OpenRouter API key", type="password", key="translation_openrouter_key")
+            translation_api_key = translation_api_key.strip()
         else:
             translation_api_key = os.getenv("OPENAI_API_KEY", "") or (api_key if provider == "openai" else "")
             if translation_provider in {"auto", "openai"} and not translation_api_key:
@@ -1031,6 +1076,24 @@ if st.session_state.get("ctx") != ctx_key:
 checkpoint_homework()
 
 if is_hw:
+    if st.session_state.get("save_hw_progress"):
+        try:
+            code = save_homework()
+        except OSError:
+            save_status.warning("לא ניתן לשמור התקדמות כרגע. אפשר להוריד גיבוי."
+                                if ui_is_he else "Could not save progress. You can download a backup.")
+        else:
+            save_status.caption("שמרו את הקוד. כל מי שמחזיק בו יכול לפתוח את ההתקדמות."
+                                if ui_is_he else "Keep this code. Anyone with it can open this progress.")
+            save_status.code(code, language=None)
+    backup_data = progress_store.encode_progress(st.session_state.hw_progress).encode("utf-8")
+    if len(backup_data) <= progress_store.BACKUP_LIMIT:
+        backup_download.download_button(
+            "הורדת גיבוי" if ui_is_he else "Download progress backup",
+            data=backup_data, file_name="tutor-homework-progress.json", mime="application/json",
+        )
+    else:
+        backup_download.caption("הגיבוי גדול מ־10 MB." if ui_is_he else "Progress exceeds the 10 MB backup limit.")
     st.subheader(f"{display_name} · " + (f"שאלה {selected_problem}" if ui_is_he else f"Question {selected_problem}"))
     st.caption(("עמודים בקובץ: " if ui_is_he else "PDF pages: ") +
                ", ".join(map(str, selected_statement.get("pages", []))))
@@ -1073,7 +1136,7 @@ if not is_hw and not st.session_state.get("display"):
     )
     st.markdown(
         f"<div style='text-align:center;margin-bottom:1.3rem'><span class='pill'>"
-        f"<span class='dot'></span>{rag.llm_label(provider, model)} · "
+        f"<span class='dot'></span>{html.escape(rag.llm_label(provider, model))} · "
         f"{t('week_scope', week=week)}</span></div>",
         unsafe_allow_html=True,
     )
@@ -1131,11 +1194,10 @@ if question and not (is_hw and homework[sel].get("source_error")):
         st.stop()
 
     try:
-        dedicated_translation_llm = None if not q_is_he else (
-            rag.get_translation_llm(api_key=translation_api_key)
-            if translation_provider == "auto" else
-            rag.get_translation_llm(translation_provider, translation_model,
-                                    api_key=translation_api_key))
+        dedicated_translation_llm = None
+        if q_is_he:
+            dedicated_translation_llm = rag.get_translation_llm(
+                translation_provider, translation_model, api_key=translation_api_key)
         translator_setup_error = None
     except Exception as exc:
         dedicated_translation_llm = None
@@ -1354,7 +1416,10 @@ if question and not (is_hw and homework[sel].get("source_error")):
                 render_md(slot, answer, rtl=rag.is_hebrew(answer))
                 status.update(label=mt("insufficient_evidence"), state="error", expanded=False)
             elif generation_error is not None:
-                answer = mt("model_error_answer", error=generation_error)
+                details = str(generation_error)
+                if api_key:
+                    details = details.replace(api_key, "[redacted]")
+                answer = mt("model_error_answer", error=details)
                 render_md(slot, answer, rtl=rag.is_hebrew(answer))
                 status.update(label=mt("model_error"), state="error", expanded=False)
             elif q_is_he:
@@ -1443,4 +1508,9 @@ if question and not (is_hw and homework[sel].get("source_error")):
         },
     ]
     checkpoint_homework()
+    if is_hw and st.session_state.get("save_hw_progress"):
+        try:
+            save_homework()
+        except OSError:
+            pass  # The rerun retries the write and shows the result in the sidebar.
     st.rerun()

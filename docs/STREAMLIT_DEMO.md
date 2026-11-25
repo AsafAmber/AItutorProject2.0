@@ -31,8 +31,8 @@ LLM_TIMEOUT_SECONDS = "120"
    hint. Check API usage in your provider dashboard.
 
 Copyable template: `.streamlit/secrets.toml.example`. Secrets uses TOML, including
-quoted strings, rather than `.env` syntax. To preview locally, save your settings
-in the ignored `.streamlit/secrets.toml` and run from the repository root:
+quoted strings. To preview locally, save your settings in the ignored
+`.streamlit/secrets.toml` and run from the repository root:
 
 ```sh
 streamlit run cloud/streamlit_app.py
@@ -40,9 +40,11 @@ streamlit run cloud/streamlit_app.py
 
 ## Manage models
 
-The demo fixes model selectors to the configuration in Secrets so visitors cannot
-select a more expensive model using your shared key. Edit Secrets and reboot to
-change models. `streamlit run app.py` retains the local experiment controls.
+Visitors can select **OpenAI** or **OpenRouter** in the **Provider** menu.
+`LLM_PROVIDER` sets the initial selection. Each model stays fixed to the ID in
+Secrets. For a provider with no key in Secrets, visitors can enter a key in a
+password field. Leave `TRANSLATION_PROVIDER = "tutor"` to use whichever provider
+and key the visitor selects for Hebrew too.
 
 | Role | Setting | Where it runs |
 |---|---|---|
@@ -56,7 +58,7 @@ For a separate translator, choose `openai` with `TRANSLATION_MODEL` and
 Changing `EMBED_MODEL` requires a reboot and automatically rebuilds the index;
 retrieval thresholds may need recalibration for a different embedding model.
 
-To use OpenRouter instead, replace the Secrets configuration with:
+To start with OpenRouter, set these values in Secrets:
 
 ```toml
 LLM_PROVIDER = "openrouter"
@@ -83,8 +85,20 @@ CPU-only PyTorch to avoid NVIDIA packages, but memory fit must be confirmed on
 the deployed app. If it exceeds Community Cloud limits, move retrieval to a
 hosted service or use a larger host.
 
-Saved homework progress uses local container disk and may disappear on reboot or
-redeployment. Durable student progress needs external storage.
+## Persistent homework progress
+
+Set `HOMEWORK_PROGRESS_DATABASE_URL` in Streamlit Secrets to a reachable
+PostgreSQL database to keep resume codes through reboots and redeployments.
+Use a connection URL such as `postgresql://user:password@host/database?sslmode=require`.
+The database user needs permission to create and use the `tutor_homework_progress`
+table. Set the same URL in a Docker or local deployment with the same course to
+resume there using the same code.
+
+Without a database, codes use the current server's disk. In Homework mode, open
+**Resume saved progress** and use **Download progress backup** to keep a copy on
+your device. Use **Restore backup** to continue from that file on any deployment
+with the same course. You can also use this to move existing disk saves before
+switching to PostgreSQL.
 
 Official references: [deployment](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy),
 [secrets](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management),

@@ -35,6 +35,19 @@ def test_invalid_or_corrupt_save(tmp_path):
             saves.read_progress(code, tmp_path)
 
 
+def test_configured_directory_and_portable_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOMEWORK_PROGRESS_DIR", str(tmp_path))
+    monkeypatch.delenv("HOMEWORK_PROGRESS_DATABASE_URL", raising=False)
+    code = saves.new_code()
+    data = {"assignment": "HW1", "question": 2, "completed": {}, "conversations": {}}
+    saves.write_progress(code, data)
+    assert saves.save_path(code).parent == tmp_path
+    backup = saves.encode_progress(saves.read_progress(code))
+    saves.delete_progress(code)
+    assert not saves.save_path(code).exists()
+    assert saves.decode_progress(backup.encode("utf-8")) == data
+
+
 def test_changed_material_invalidates_chat():
     original = saves.context_id("hw_1", 1, "pdf", ["BFS"])
     for args in [("hw_1", 2, "pdf", ["BFS"]), ("hw_2", 1, "pdf", ["BFS"]),
@@ -107,6 +120,27 @@ def test_save_resume_and_opt_out(homework_app):
     fresh.toggle(key="save_hw_widget").set_value(False).run()
     assert not fresh.exception
     assert not saves.save_path(code, directory).exists()
+
+
+def test_restore_portable_backup_without_server_storage(homework_app, monkeypatch):
+    import streamlit as st
+
+    app, directory = homework_app
+    app.radio(key="hw_question").set_value(2).run()
+    app.checkbox[0].check().run()
+    app.session_state.display = [{"role": "user", "content": "Portable question", "rtl": False}]
+    app.run()
+    payload = saves.encode_progress(app.session_state.hw_progress).encode("utf-8")
+    upload = SimpleNamespace(size=len(payload), getvalue=lambda: payload)
+    monkeypatch.setattr(st, "file_uploader", lambda *args, **kwargs: upload)
+    app.radio(key="hw_question").set_value(3).run()
+    next(b for b in app.button if b.label == "Restore backup").click().run()
+    assert not app.exception
+    assert app.radio(key="hw_question").value == 2
+    assert app.checkbox[0].value
+    assert app.session_state.display[0]["content"] == "Portable question"
+    assert not app.toggle(key="save_hw_widget").value
+    assert not list(directory.glob("*.json"))
 
 
 def test_generic_help_uses_sidebar_problem(homework_app, monkeypatch):

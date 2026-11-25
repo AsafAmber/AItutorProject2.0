@@ -89,6 +89,22 @@ API for answers and translation, runs search embeddings on CPU, and builds the
 missing index automatically. See [deployment and model settings](docs/STREAMLIT_DEMO.md)
 and the [Secrets template](.streamlit/secrets.toml.example).
 
+## Run in Docker
+
+```bash
+docker build -t tutor-bot .
+docker run --rm --name tutor-bot -p 8501:8501 \
+  --mount source=tutor-homework,target=/app/db/homework_progress tutor-bot
+```
+
+Open **http://localhost:8501**. The first startup builds the search index on CPU.
+Select OpenRouter and enter your key in the sidebar. To load settings from `.env`,
+add `--env-file .env` before the image name. If you use Ollama on the host, set
+`OLLAMA_BASE_URL` to its address as reachable from the container.
+The `tutor-homework` [Docker volume](https://docs.docker.com/engine/storage/volumes/)
+keeps resume codes and homework progress when the container is replaced. Use the
+same volume name each time, or set `HOMEWORK_PROGRESS_DATABASE_URL` for shared storage.
+
 ## Choosing a model
 
 Set the provider in `.env`, or switch it in the sidebar under **Model**. Restart the
@@ -117,6 +133,8 @@ OPENROUTER_API_KEY=sk-or-...
 `TRANSLATION_OPENROUTER_MODEL` picks a different model for translation only. In the
 sidebar, OpenRouter offers common models plus **Custom** for any model ID listed at
 [openrouter.ai/models](https://openrouter.ai/models).
+The hosted demo also offers **OpenRouter** in its **Provider** menu. When the
+deployment has no OpenRouter key configured, paste your own in the password field.
 
 ### Model comparison
 
@@ -226,14 +244,20 @@ guide: [docs/HEBREW.md](docs/HEBREW.md).
   your selected assignment/question, completed marks, and question conversations.
   Saving is off by default. Turning it off deletes the saved copy and retains the
   current session's progress. Anyone with your code can open the save.
-  Saves live in `db/homework_progress/` on this app installation, are excluded from
-  git, and do not follow you to another clone or server. No provider settings or
-  API keys are stored. Chats are reset for changed PDFs or allowed course topics;
-  completed marks are reset for changed PDFs.
+  Local runs use the ignored `db/homework_progress/` directory by default. For
+  Streamlit Community Cloud, replaceable containers, or multiple deployments,
+  set `HOMEWORK_PROGRESS_DATABASE_URL` to the same PostgreSQL database on each
+  instance to keep using the same codes. The app creates its table on first use.
+  **Resume saved progress** also has **Download progress backup** and **Restore
+  backup**. Keep a copy of the JSON file to move your homework progress between
+  independent installations with the same course. Turn on saving after restoring
+  a backup to create a new resume code. Progress
+  contains your homework activity. Chats are reset for changed PDFs or allowed
+  course topics, and completed marks are reset for changed PDFs.
 
 ## Configuration reference
 
-All settings live in `.env` (see [.env.example](.env.example)). The most useful ones:
+Set these in `.env`, Streamlit Secrets, or the process environment. Local example settings are in [.env.example](.env.example).
 
 | Setting | Default | Purpose |
 |---|---|---|
@@ -250,6 +274,8 @@ All settings live in `.env` (see [.env.example](.env.example)). The most useful 
 | `EVIDENCE_MIN_SIMILARITY` | `0.60` | Relevance floor for passages; re-tune if you change the embedding model |
 | `EMBED_DEVICE` | `cpu` | Set to `cuda` to run the embedding model on a GPU (needs a CUDA build of PyTorch) |
 | `UI_LANGUAGE` | `en` | `he` for Hebrew interface labels |
+| `HOMEWORK_PROGRESS_DIR` | `db/homework_progress/` | Writable directory for file-backed resume codes |
+| `HOMEWORK_PROGRESS_DATABASE_URL` | unset | PostgreSQL connection URL for durable, shared resume codes. Takes precedence over the file directory. |
 
 ## Updating the course
 

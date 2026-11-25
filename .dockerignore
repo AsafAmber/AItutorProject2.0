@@ -1,0 +1,14 @@
+.git
+.env*
+.streamlit/secrets.toml
+.venv
+venv
+.pip-tmp
+.pytest_cache
+**/__pycache__
+db/index
+db/chunks.jsonl
+db/homework_progress
+tests
+test_*.py
+simple_test.py
